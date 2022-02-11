@@ -1,5 +1,6 @@
 # pirrigation
-Simple irrigation management system with Raspberry PI
+
+<strong>Simple irrigation management system with Raspberry PI</strong>
 
 Project: Irrigation automation through a 1HP submersible pump installed at a depth of 50 meters.
 
