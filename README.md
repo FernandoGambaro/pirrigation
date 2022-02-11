@@ -18,3 +18,5 @@ Power supply for the Raspberry 5v 2.5amp
 6 5v relays, (SRD-05VCD-SL-C) are only used simultaneously.
 Transformer 220v to 24v (To power the solenoids that divide the irrigation, tank and pump sectors)
 LCD1602 module (to display the status of the pump)
+
+![](riego.png)
