@@ -1,0 +1,926 @@
+Proyecto: Automatización del riego a través de una bomba sumergible de 1HP instalada a 50mts de profundidad. 
+
+Escenario conocido:
+	El pozo tiene un bajo caudal de agua por lo que el funcionamiento de la bomba no puede exceder los 15 minutos, teniendo por lo menos 40 minutos de recuperación del caudal. Es decir la bomba funciona durante 15minutos y descansa durante al menos 40.
+
+Materiales:
+	Riego: Bomba sumergible 1HP
+		Manguera plastiducto negro los metros necesarios.
+		Aspersores de riego, los necesarios. (tener en cuenta que debido al bajo caudal es recomendable no utilizar más de 4 grandes simultáneamente)
+
+Automatismo y control:
+		Dispositivo Raspberry Pi 3
+		Fuente de alimentación para la Raspberry 5v 2.5amp
+		6 relés 5v, (SRD-05VCD-SL-C) solo se usan dis simultaneamente.
+		Trasformador 220v a 24v (Para alimentar los solenoides que dividen los sectores de riego, tanque y bomba)
+		Modulo LCD1602 (para mostrar el estado de la bomba)
+
+Esquema de conexiones.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Preparando el software
+
+Instalaremos apache, mysql, php para luego instalar la pagina web desde donde gestionaremos la programación del riego.
+
+1) Instalamos apache server
+
+Actualizar Raspberry
+$ sudo apt update
+$ sudo apt upgrade -y
+Instalar Apache
+
+$ sudo apt install apache2 -y
+$ sudo a2enmod rewrite
+$ sudo service apache2 restart
+
+Modificar 
+$ sudo nano /etc/apache2/apache2.conf y cambiar AllowOverride None a AllowOverride All como se muestra:
+
+<Directory /var/www/>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+</Directory>
+
+Reiniciar apache 
+$ sudo service apache2 restart
+
+Verificamos su funcionamiento:
+
+$ ifconfig  (debe buscar eth0 o wlan0)
+
+2) Instalamos php
+
+$ sudo apt install php libapache2-mod-php -y
+
+Crear el siguiente archivo para verificar funcionamiento:
+
+$ cd /var/www/html
+$ sudo nano index.php
+Con la siguiente linea adentro:
+
+<?php echo “Hello World”; ?>
+$ sudo rm index.html
+$ sudo service apache2 restart
+Revisar la IP de la Raspberry Pi 3.
+
+3) Instalamos Mysql
+
+$ sudo apt install mariadb-server -y
+$ sudo service apache2 restart
+$ sudo mysql_secure_installation
+
+Se le preguntara por la contraseña actual del usuario root (default es blank): presione Enter.
+
+Escriba la contraseña de root, type Y and press Enter.
+
+Type in a new password and press Enter. Important: remember this root password.
+
+Re-enter the new password and press Enter.
+
+Type Y and press Enter to Remove anonymous users.
+
+Type Y and press Enter to Disallow root login remotely.
+
+Type Y and press Enter to Remove test database and access to it.
+
+Type Y and press Enter to Reload privilege tables now.
+
+When complete, you will see the message All done! and Thanks for using MariaDB!.
+
+$ sudo mysql -uroot -p
+Enter the root password.
+
+$ create database riego;
+$ GRANT ALL PRIVILEGES ON riego.* TO 'root'@'localhost' IDENTIFIED BY 'YOURROOTPASSWORD';
+$ FLUSH PRIVILEGES;
+
+
+Opcionalmente podemos instala PhpMyAdmin para la gestión de la base de datos
+
+$ sudo apt install phpmyadmin -y
+Debe ser seleccionado [*]apache2 con al SpaceBar de otro modo la configuración falla.
+
+Cuando consulte: ¿Desea configurar la base de datos para phpmyadmin con <<dbconfig-common>>?
+
+Seleccionar Si.
+
+Recuerde la contraseña ingresada, será necesaria para ingresar a PhpMyAdmin
+
+Una vez finalizado ingrese a la ip de la Raspberry Pi 3 /phpmyadmin en el navegador.
+
+user: phpmyadmin
+pass: “la ingresada en su configuración”
+
+Para gestionar los archivos de la pagina web instalamos un FTP server
+
+$ sudo apt install vsftpd -y
+$ sudo nano /etc/vsftpd.conf
+Buscar: (Ctrl & W)
+
+local_enable=YES
+ssl_enable=NO
+Change to:
+
+#local_enable=YES
+#ssl_enable=NO
+Add to the bottom of the file:
+
+# CUSTOM
+ssl_enable=YES
+local_enable=YES
+chroot_local_user=YES
+local_root=/var/www
+user_sub_token=pi
+write_enable=YES
+local_umask=002
+allow_writeable_chroot=YES
+ftpd_banner=Welcome to my Raspberry Pi FTP service.
+
+Ctrl & O > Enter > Ctrl & X
+
+$ sudo usermod -a -G www-data pi
+$ sudo usermod -m -d /var/www pi
+$ sudo chown -R www-data:www-data /var/www
+$ sudo chmod -R 775 /var/www
+$ sudo reboot
+
+
+
+Para que funciones se debe instalar 
+sudo apt install python-mysql.connector 
+
+El código de riego.py es:
+
+
+#!/usr/bin/env python
+import RPi.GPIO as GPIO
+import datetime
+import time
+import os
+import Adafruit_DHT
+import psutil
+#Importa para poder consultar una base de datos
+import mysql.connector
+from mysql.connector import errorcode
+#Limpio pantalla
+os.system('clear')
+
+global TR, Descansar, Descanso, TD, TRcero, Apagada, RS, RSh, RSm, Sector, Riego, Tanque, Encendida, hora, minuto, Aviso, running, prevSec, time1, secs, mins, hours
+global AvisoApagada, AvisoDisponible, ApagadaManual, DHT_SENSOR, DHT_PIN, num_of_secs
+
+BUTTON_PUMP = 7
+BUTTON_RIEGO = 8
+BUTTON_SECTOR = 10
+
+DHT_SENSOR = Adafruit_DHT.DHT11
+DHT_PIN = 3
+
+# We first check if a libgpiod process is running. If yes, we kill it!
+for proc in psutil.process_iter():
+    if proc.name() == 'libgpiod_pulsein' or proc.name() == 'libgpiod_pulsei':
+        proc.kill()
+
+#Duracion del encendido de la bomba en segundos
+TR = 15*60
+TRcero = TR
+#Tiempo descanso bomba 50 minutos
+#Tiempo descanso bomba, medido en segundos
+Descanso = 50*60
+TD = Descanso
+#Si debe descansar 0 no, 1 si
+Descansar = 0
+#Riego Sector / Hora / Min Riego
+RS = 0
+RSh = 0
+RSm = 0
+#Defino algunas variables
+Sector = 0
+Riego = 0
+Tanque = 0
+Encendida = time.time()
+hora = 18
+minuto = 0
+Aviso = 0
+ApagadaManual = 0
+AvisoApagada = 0
+AvisoDisponible = 0
+FondoIzquierdo = 35
+FondoDerecho = 36
+FrenteIzquierdo = 37
+FrenteDerecho = 38
+RiegoTanque = 33
+BOMBA = 40 #Enciendo la bomba y el transformador a 24V
+# Muestro tiempo en LCD display \n = new line
+def set_time_variable():
+    global time1, prevSec, secs, mins, hours, running
+    time1 = ''
+    prevSec = ''
+    if (TR < 60):
+        secs = TR
+        mins = 0
+    else:
+        mins = TR/60
+        secs = 0
+    hours = 0
+    running = False
+
+#Defino un procedimiento para guardar la actividad en una base de datos.
+def save_logs(hora,minuto,hace):
+    try:
+        cnx = mysql.connector.connect(user='riego', password='riego123', host='127.0.0.1', database='riego')
+        mycursor = cnx.cursor()
+        sql_insert_query = "insert into logs (hora, minuto, hace) values ('{}','{}','{}')"
+        sql_insert_query = sql_insert_query.format(hora, minuto, hace)
+        mycursor.execute(sql_insert_query)
+#        print(hace)
+    except mysql.connector.Error as error:
+        cnx.rollback()
+        print("Error {}".format(error))
+    finally:
+        mycursor.close()
+        cnx.commit()
+#        print("Added Successfully")
+#    return
+
+def habilitado():
+    cnx = mysql.connector.connect(user='riego', password='riego123', host='127.0.0.1', database='riego')
+    cursor = cnx.cursor()
+    query = ("SELECT activo FROM estado WHERE estadocod = 1")
+    try:
+        cursor.execute(query)
+#        print("Consulta ", cursor.statement)
+        result = cursor.fetchone()
+        if result:
+            if result[0] == 1:
+                return True
+            else:
+                return False
+    except mysql.connector.Error as e:
+        print("Error ", e)
+    finally:
+        if cnx.is_connected():
+            cursor.close()
+            cnx.close()
+#                                              print("MySQL connection is closed")
+            time.sleep(0.5)
+    return False
+
+def apago_todo():
+    global Sector, Tanque, Apagada, Aviso
+    GPIO.output(BOMBA,GPIO.HIGH)
+#    time.sleep(5)
+    GPIO.output(FondoIzquierdo,GPIO.HIGH)
+    GPIO.output(FondoDerecho,GPIO.HIGH)
+    GPIO.output(FrenteIzquierdo,GPIO.HIGH)
+    GPIO.output(FrenteDerecho,GPIO.HIGH)
+    Sector = 0
+    Tanque = 0
+    Aviso = 0
+    Riego = 0
+    Apagada = time.time()
+    return
+
+def apago_sector():
+    if GPIO.input(RiegoTanque) == 0:
+        GPIO.output(RiegoTanque, GPIO.HIGH)
+    if GPIO.input(FondoIzquierdo) == 0:
+        GPIO.output(FondoIzquierdo, GPIO.HIGH)
+    if GPIO.input(FondoDerecho) == 0:
+        GPIO.output(FondoDerecho, GPIO.HIGH)
+    if GPIO.input(FrenteIzquierdo) == 0:
+        GPIO.output(FrenteIzquierdo, GPIO.HIGH)
+    if GPIO.input(FrenteDerecho) == 0:
+        GPIO.output(FrenteDerecho, GPIO.HIGH)
+    return
+
+def enciendo_sector(sector):
+    if sector == 0:
+        sector = FondoIzquierdo
+        Detalle = "Fondo Izquierdo"
+    if sector == 1:
+        sector = FondoDerecho
+        Detalle = "Fondo Derecho"
+    if sector == 2:
+        sector = FrenteIzquierdo
+        Detalle = "Frente Izquierdo"
+#    if sector == 3:
+#        sector = FrenteDerecho
+        Detalle = "Frente Derecho"
+    print("Encendido manual riego sector ", Detalle)
+    lcd_send_byte(LCD_LINE_1, LCD_CMD)
+    lcd_message(Detalle)
+    lcd_send_byte(LCD_LINE_2, LCD_CMD)
+    lcd_message(" ")
+    GPIO.output(sector, GPIO.LOW)
+    return
+
+def se_apago(TiempoRiego):
+    global Aviso, Descansar, AvisoApagada
+#    Si se enciendo la bomba manualmente muchas veces, y se consume el tiempo de funcionamiento maximo
+#    El tiempo de funcionamiento es el tiempo inicial menos el que estuvo funcionando
+    Apagada = time.time()
+    TD = 0
+    if GPIO.input(BOMBA) == 1 and (Apagada - Encendida ) < TiempoRiego:
+        TR = TiempoRiego - ( Apagada - Encendida )
+#        minute_ct = 60
+#        dura = divmod((Apagada - Encendida), minute_ct)[0]
+#        print("Tiempo de funcionamiento", Apagada - Encendida, "Resta ", TR)
+    else:
+        TR = TRcero
+        TD = Descanso
+        print("La bomba debe descansar")
+        Aviso = 0
+        AvisoApagada = 0
+    return TR, Apagada, TD
+
+def temperatura():
+    global DHT_SENSOR, DHT_PIN
+    humidity, temperature = Adafruit_DHT.read_retry(DHT_SENSOR, DHT_PIN)
+    if humidity is not None and temperature is not None:
+        print("Temp={0:0.1f}C  Humidity={1:0.1f}%".format(temperature, humidity))
+        lcd_send_byte(LCD_LINE_2, LCD_CMD)
+        lcd_message("T={0:0.1f}C, H={1:0.1f}%".format(temperature, humidity))
+    return
+
+def countdown():
+    global prevSec, time1, secs, mins, hours, running, TD, TR, Apagada, Descansar, Tanque, Riego, Sector, ApagadaManual, num_of_secs
+    if running:
+        newSec = time.strftime('%S')
+    else:
+        newSec = ''
+        prevSec = ''
+    if newSec != prevSec:
+        prevSec = newSec
+        secs = secs - 1
+        if secs < 0:
+            secs = 59
+            mins = mins - 1
+            if mins < 0:
+                mins = 59
+                hours = hours - 1
+                if hours < 0:
+                    hours = 0
+                    mins = TD/60
+                    secs = 0
+                    running = False
+                    Tanque = 0
+                    Riego = 0
+                    ApagadaManual = 0
+                    if Descansar == 0:
+                        Descansar = 1
+                    else:
+                        Descansar = 0
+#                        TR, Apagada, TD = se_apago(TR)
+#    time2 = '%02d:%02d:%02d' % (hours, mins, secs)
+    time2 = '%02d:%02d' % (mins, secs)
+    if time2 != time1:
+        time1 = time2
+        lcd_send_byte(LCD_LINE_2, LCD_CMD)
+        lcd_message('Resta %s' % time2)
+
+    return
+
+# Zuordnung der GPIO Pins (ggf. anpassen)
+LCD_RS = 26
+LCD_E  = 24
+LCD_DATA4 = 22
+LCD_DATA5 = 18
+LCD_DATA6 = 16
+LCD_DATA7 = 12
+
+LCD_WIDTH = 16         # Zeichen je Zeile
+LCD_LINE_1 = 0x80     # Adresse der ersten Display Zeile
+LCD_LINE_2 = 0xC0     # Adresse der zweiten Display Zeile
+LCD_CHR = GPIO.HIGH
+LCD_CMD = GPIO.LOW
+E_PULSE = 0.0005
+E_DELAY = 0.0005
+
+def lcd_send_byte(bits, mode):
+    # Pins auf LOW setzen
+    GPIO.output(LCD_RS, mode)
+    GPIO.output(LCD_DATA4, GPIO.LOW)
+    GPIO.output(LCD_DATA5, GPIO.LOW)
+    GPIO.output(LCD_DATA6, GPIO.LOW)
+    GPIO.output(LCD_DATA7, GPIO.LOW)
+    if bits & 0x10 == 0x10:
+      GPIO.output(LCD_DATA4, GPIO.HIGH)
+    if bits & 0x20 == 0x20:
+      GPIO.output(LCD_DATA5, GPIO.HIGH)
+    if bits & 0x40 == 0x40:
+      GPIO.output(LCD_DATA6, GPIO.HIGH)
+    if bits & 0x80 == 0x80:
+      GPIO.output(LCD_DATA7, GPIO.HIGH)
+    time.sleep(E_DELAY)
+    GPIO.output(LCD_E, GPIO.HIGH)
+    time.sleep(E_PULSE)
+    GPIO.output(LCD_E, GPIO.LOW)
+    time.sleep(E_DELAY)
+    GPIO.output(LCD_DATA4, GPIO.LOW)
+    GPIO.output(LCD_DATA5, GPIO.LOW)
+    GPIO.output(LCD_DATA6, GPIO.LOW)
+    GPIO.output(LCD_DATA7, GPIO.LOW)
+    if bits&0x01==0x01:
+      GPIO.output(LCD_DATA4, GPIO.HIGH)
+    if bits&0x02==0x02:
+      GPIO.output(LCD_DATA5, GPIO.HIGH)
+    if bits&0x04==0x04:
+      GPIO.output(LCD_DATA6, GPIO.HIGH)
+    if bits&0x08==0x08:
+      GPIO.output(LCD_DATA7, GPIO.HIGH)
+    time.sleep(E_DELAY)
+    GPIO.output(LCD_E, GPIO.HIGH)
+    time.sleep(E_PULSE)
+    GPIO.output(LCD_E, GPIO.LOW)
+    time.sleep(E_DELAY)
+
+def display_init():
+    lcd_send_byte(0x33, LCD_CMD)
+    lcd_send_byte(0x32, LCD_CMD)
+    lcd_send_byte(0x28, LCD_CMD)
+    lcd_send_byte(0x0C, LCD_CMD)
+    lcd_send_byte(0x06, LCD_CMD)
+    lcd_send_byte(0x01, LCD_CMD)
+
+def lcd_message(message):
+    message = message.ljust(LCD_WIDTH," ")
+    for i in range(LCD_WIDTH):
+        lcd_send_byte(ord(message[i]),LCD_CHR)
+
+def button_callback(channel):
+    print("Boton! "+ str(channel))
+
+try:
+    # Main program block
+    # Inicializo varibles del countdown
+    set_time_variable()
+    #Definom algubnas va de Reigo riables
+    Apagada  = 0
+    #Inicializo los pines de salida FondoIzquierdo, FondoDerecho, FrenteIzquierdo y FrenteDerecho para activar los solenoides
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setwarnings(False)
+
+    GPIO.setup(RiegoTanque,GPIO.OUT,initial=GPIO.HIGH)
+
+    GPIO.setup(FondoIzquierdo,GPIO.OUT,initial=GPIO.HIGH)
+    GPIO.setup(FondoDerecho,GPIO.OUT,initial=GPIO.HIGH)
+    GPIO.setup(FrenteIzquierdo,GPIO.OUT,initial=GPIO.HIGH)
+    GPIO.setup(FrenteDerecho,GPIO.OUT, initial=GPIO.HIGH)
+    GPIO.setup(BOMBA,GPIO.OUT, initial=GPIO.HIGH)
+
+    # Inicializo los botones
+    GPIO.setup(BUTTON_PUMP, GPIO.IN, pull_up_down=GPIO.PUD_UP) #Boton para encender bomba manualmente
+    GPIO.add_event_detect(BUTTON_PUMP,GPIO.FALLING,callback=button_callback,bouncetime=300)
+
+    GPIO.setup(BUTTON_RIEGO, GPIO.IN, pull_up_down=GPIO.PUD_UP) #Boton para encender riego manualmente
+    GPIO.add_event_detect(BUTTON_RIEGO,GPIO.FALLING,callback=button_callback,bouncetime=300)
+
+    GPIO.setup(BUTTON_SECTOR, GPIO.IN, pull_up_down=GPIO.PUD_UP) #Boton para encender sector riego
+    GPIO.add_event_detect(BUTTON_SECTOR,GPIO.FALLING,callback=button_callback,bouncetime=300)
+
+    # initialisieren
+    GPIO.setup(LCD_E, GPIO.OUT)
+    GPIO.setup(LCD_RS, GPIO.OUT)
+    GPIO.setup(LCD_DATA4, GPIO.OUT)
+    GPIO.setup(LCD_DATA5, GPIO.OUT)
+    GPIO.setup(LCD_DATA6, GPIO.OUT)
+    GPIO.setup(LCD_DATA7, GPIO.OUT)
+
+    display_init()
+    lcd_send_byte(LCD_LINE_1, LCD_CMD)
+    lcd_message("Iniciando ")
+    lcd_send_byte(LCD_LINE_2, LCD_CMD)
+    lcd_message(" ")
+    time.sleep(0.5)
+
+    while True:
+        now = datetime.datetime.now().time()
+        hora = now.hour
+        minuto = now.minute
+        if ( Apagada + TD ) < time.time():
+            #Si presiono el boton de encender bomba para llenado tanque
+            button_pump = GPIO.input(BUTTON_PUMP)
+            if  button_pump == False:
+                #Si la bomba esta apagada y no esta en riego
+                if GPIO.input(BOMBA) == 1 and Riego == 0:
+                    print("Enciendo bomba para tanque")
+                    set_time_variable()
+                    running = True
+                    GPIO.output(RiegoTanque, GPIO.LOW)
+                    GPIO.output(BOMBA, GPIO.LOW)
+                    Encendida = time.time()
+                    lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                    lcd_message("Llenado tanque")
+                    lcd_send_byte(LCD_LINE_2, LCD_CMD)
+                    lcd_message(" ")
+                    mins = TR/60
+                    Riego = 0
+                    Tanque = 1
+                    Aviso = 0
+                    AvisoApagada = 0
+                elif GPIO.input(BOMBA) == 0 and Riego == 1:
+                    # Si la bomba esta encendida en riego la paso a llenado de tanque
+                    GPIO.output(RiegoTanque, GPIO.LOW)
+                    lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                    lcd_message("Llenado tanque")
+                    lcd_send_byte(LCD_LINE_2, LCD_CMD)
+                    lcd_message(" ")
+                    Riego = 0
+                    Tanque = 1
+                    running = True
+                    AvisoApagada = 0
+                elif GPIO.input(BOMBA) == 0:
+                    print("Si la bomba esta encendida la apago")
+                    lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                    lcd_message("Bomba apagada")
+                    temperatura()
+                    apago_todo()
+                    Tanque = 0
+                    Riego = 0
+                    TR, Apagada, TD = se_apago(TR)
+                    running = False
+                    ApagadaManual = 1
+
+            while GPIO.input(BUTTON_PUMP) == False:
+                time.sleep(0.2)
+
+            #Si presiono el boton de encender bomba para llenado riego
+            button_riego = GPIO.input(BUTTON_RIEGO)
+            if  button_riego == False:
+                #Si la bomba esta apagada y no esta en riego
+                if GPIO.input(BOMBA) == 1 and Tanque == 0:
+                    print("Enciendo bomba para riego")
+                    set_time_variable()
+                    running = True
+                    GPIO.output(RiegoTanque, GPIO.HIGH)
+                    GPIO.output(FondoIzquierdo, GPIO.LOW)
+                    GPIO.output(BOMBA, GPIO.LOW)
+                    Encendida = time.time()
+                    lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                    lcd_message("Riego Fondo izq.")
+                    lcd_send_byte(LCD_LINE_2, LCD_CMD)
+                    lcd_message(" ")
+                    mins = TR/60
+                    Riego = 1
+                    Tanque = 0
+                    Aviso = 0
+                    Sector = 1
+                    AvisoApagada = 0
+                elif GPIO.input(BOMBA) == 0 and Tanque == 1:
+                    # Si la bomba esta encendida llenando el tanque la paso a riego
+                    GPIO.output(RiegoTanque, GPIO.HIGH)
+                    GPIO.output(FondoIzquierdo, GPIO.LOW)
+                    lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                    lcd_message("Riego Fondo izq.")
+                    lcd_send_byte(LCD_LINE_2, LCD_CMD)
+                    lcd_message(" ")
+                    Riego = 1
+                    Tanque = 0
+                    running = True
+                elif GPIO.input(BOMBA) == 0:
+                    print("Si la bomba esta encendida la apago")
+                    lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                    lcd_message("Bomba apagada")
+                    temperatura()
+                    apago_todo()
+                    Tanque = 0
+                    Riego = 0
+                    TR, Apagada, TD = se_apago(TR)
+                    running = False
+                    AvisoApagada = 0
+                    ApagadaManual = 1
+
+            while GPIO.input(BUTTON_RIEGO) == False:
+                time.sleep(0.2)
+# En caso de presionar el boton de seleccion de sectore de riego
+            button_sector = GPIO.input(BUTTON_SECTOR)
+            if button_sector == False:
+                print(" sector ", Sector, "Tanque ", Tanque, " Riego ", Riego)
+                AvisoApagada = 0
+                if GPIO.input(BOMBA) == 0 and Riego == 1:
+                    if Sector == 1:
+                        apago_sector()
+                        enciendo_sector(Sector)
+                        Sector = 2
+                    elif Sector == 2:
+                        apago_sector()
+                        enciendo_sector(Sector)
+                        Sector = 0
+                    elif Sector == 0:
+                        apago_sector()
+                        enciendo_sector(Sector)
+                        Sector = 1
+                #Si la bomba esta encendida llenando tanque la cambio a riego
+                elif GPIO.input(BOMBA) == 0 and Riego == 0 and Tanque == 1:
+                    apago_sector()
+                    enciendo_sector(0)
+                    Sector = 1
+                    Riego = 1
+                elif GPIO.input(BOMBA) == 1:
+                    enciendo_sector(0)
+                    Sector = 1
+                    GPIO.output(BOMBA, GPIO.LOW)
+                    Riego = 1
+                    AvisoApagada = 0
+                    #mins = TR/60
+                    Encendida = time.time()
+                    running = True
+
+            while GPIO.input(BUTTON_SECTOR) == False:
+                time.sleep(0.2)
+
+#Para el caso del riego programado
+            if now.second == 0 and (Apagada + TD) < time.time() and GPIO.input(BOMBA) == 1:
+#                print("Realizo consulta a la base de datos: ", now.second)
+                cnx = mysql.connector.connect(user='riego', password='riego123', host='127.0.0.1', database='riego')
+                cursor = cnx.cursor()
+                query = ("SELECT hora, minuto, sector FROM horarios WHERE hora = %s AND minuto = %s")
+                try:
+                    cursor.execute(query, (hora, minuto))
+                    print("Consulta ", cursor.statement)
+                    result = cursor.fetchone()
+                    if result:
+                        RSh = result[0]
+                        RSm = result[1]
+                        RS = result[2]
+                        print("Hora programada ", RSh)
+
+                except mysql.connector.Error as e:
+                    print("Error ", e)
+                finally:
+                    if cnx.is_connected():
+                        cursor.close()
+                        cnx.close()
+                        #                        print("MySQL connection is closed")
+                        time.sleep(0.5)
+                if hora == RSh and minuto == RSm and (Apagada + TD) < time.time() and habilitado():
+                    if GPIO.input(BOMBA) == 1:
+                        #                        Habilito el sector de riego
+                        enciendo_sector(RS)
+                        #                        Enciendo la bomba
+                        save_logs(hora, minuto, 'Encendido programado riego')
+                        GPIO.output(BOMBA, GPIO.LOW)
+                        Encendida = time.time()
+                        lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                        lcd_message("Riego")
+                        lcd_send_byte(LCD_LINE_2, LCD_CMD)
+                        lcd_message(" programado ")
+                        running = True
+                        AvisoApagada = 0
+                temperatura()
+
+        else:
+            if Aviso == 0:
+                print("La bomba esta en descanso")
+                lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                lcd_message("En descanso")
+                lcd_send_byte(LCD_LINE_2, LCD_CMD)
+                lcd_message(" ")
+                Aviso = 1
+                running = True
+
+        if (GPIO.input(BOMBA) == 0):
+            countdown()
+
+        if (AvisoApagada == 1):
+            countdown()
+
+        if (Encendida + TR ) < time.time() and GPIO.input(BOMBA) == 0 and AvisoApagada == 0:
+            print("Por tema de seguridad apago la bomba luego del tiempo maximo permitido de funcionamiento")
+            AvisoApagada = 1
+            # Inicializo varibles del countdown
+            set_time_variable()
+            running = True
+            mins = Descanso/60
+            TD = Descanso
+            Sector = 0
+            apago_todo()
+            AvisoDisponible = 0
+            ApagadaManual = 0
+            Apagada = time.time()
+            lcd_send_byte(LCD_LINE_1, LCD_CMD)
+            lcd_message("En descanso")
+            lcd_send_byte(LCD_LINE_2, LCD_CMD)
+            lcd_message(" ")
+
+        if time.time() - (Apagada + Descanso) > 0 and ApagadaManual == 1 and GPIO.input(BOMBA) == 1:
+            ApagadaManual = 0
+            AvisoDisponible = 0
+            TR = TRcero
+#            print("diferencia ",Apagada, Descanso, time.time(),  str(Apagada + TD - time.time()))
+
+        if (Apagada + TD) < time.time() and AvisoDisponible == 0 and habilitado():
+            print("Bomba disponible")
+            # Inicializo varibles del countdown
+            set_time_variable()
+            AvisoDisponible = 1
+            AvisoApagada = 0
+            lcd_send_byte(LCD_LINE_1, LCD_CMD)
+            lcd_message(" Disponible")
+            temperatura()
+            Sector = 0
+            Riego = 0
+            Tanque = 0
+            mins = TRcero/60
+            msg = "Disponible"
+            for i in range(len(msg)):
+                lcd_send_byte(LCD_LINE_1, LCD_CMD)
+                lcd_message(msg[:i+1])
+#            lcd_send_byte(LCD_LINE_2, LCD_CMD)
+#            lcd_message(" ")
+            temperatura
+            time.sleep(0.01)
+
+
+except RuntimeError as error:
+        print(error.args[0])
+        time.sleep(2.0)
+
+except KeyboardInterrupt:
+    print("Salir")
+    save_logs(hora, minuto, 'Cancelo el programa')
+    GPIO.cleanup()
+
+finally:
+    GPIO.cleanup()
+
+*****************************************************************************
+
+Debemos configurar la base de datos donde registraremos la programación del riego, para ello utilizaremos el siguiente script en python
+
+db_riego.py
+
+from __future__ import print_function
+import mysql.connector
+from mysql.connector import errorcode
+
+DB_NAME = 'riego'
+
+TABLES = {}
+TABLES['horario'] = (
+    "CREATE TABLE `horarios` ("
+    "  `horariocod` int(11) NOT NULL AUTO_INCREMENT,"
+    "  `hora` int(2) NOT NULL,"
+    "  `minuto` int(2) NOT NULL,"
+    "  `sector` int(1) NOT NULL,"
+    "  `borrado` int(1) DEFAULT 0,"
+    "  PRIMARY KEY (`horariocod`)"
+    ") ENGINE=InnoDB")
+
+TABLES['logs'] = (
+    "CREATE TABLE `logs` ("
+    "  `logcod` int(11) NOT NULL AUTO_INCREMENT,"
+    "  `hora` int(4) NOT NULL,"
+    "  `minuto` int(2) NOT NULL,"
+    "  `hace` varchar(100) NOT NULL,"
+    "  `fecha` TIMESTAMP NOT NULL,"
+    "  PRIMARY KEY (`logcod`)"
+    ") ENGINE=InnoDB")
+
+TABLES['estado'] = (
+    "CREATE TABLE `estado` ("
+    "  `estadocod` int(11) NOT NULL AUTO_INCREMENT,"
+    "  `activo` int(2) NOT NULL,"
+    "  PRIMARY KEY (`estadocod`)"
+    ") ENGINE=InnoDB")
+
+config = {
+	'user': 'riego',
+	'password': 'riego123',
+	'host': '127.0.0.1',
+	'database': 'riego',
+	'raise_on_warnings': True
+}
+
+cnx = mysql.connector.connect(**config)
+cursor = cnx.cursor()
+def create_database(cursor):
+    try:
+        cursor.execute(
+            "CREATE DATABASE {} DEFAULT CHARACTER SET 'utf8'".format(DB_NAME))
+    except mysql.connector.Error as err:
+        print("Failed creating database: {}".format(err))
+        exit(1)
+try:
+    cursor.execute("USE {}".format(DB_NAME))
+except mysql.connector.Error as err:
+    print("Database {} does not exists.".format(DB_NAME))
+    if err.errno == errorcode.ER_BAD_DB_ERROR:
+        create_database(cursor)
+        print("Database {} created successfully.".format(DB_NAME))
+        cnx.database = DB_NAME
+    else:
+        print(err)
+        exit(1)
+
+
+for table_name in TABLES:
+    table_description = TABLES[table_name]
+    try:
+        print("Creating table {}: ".format(table_name), end='')
+        cursor.execute(table_description)
+    except mysql.connector.Error as err:
+        if err.errno == errorcode.ER_TABLE_EXISTS_ERROR:
+            print("already exists.")
+        else:
+            print(err.msg)
+    else:
+        print("OK")
+
+cursor.close()
+cnx.close()
+
+**************************************************************
+Configuración para iniciar el script de riego al reiniciar el dispositivo Raspberry Pi 3
+
+Auto Login Setup (opcional)
+Lo primero a hacer es habilitar el Auto Login en terminal de forma automática, sin interferencia del usuario.
+
+Para ello en una terminal de Raspberry Pi escribir:
+
+sudo raspi-config y presional Enter.
+
+Dentro de las opciones del menú
+
+1 - Seleccionar “System Options”
+2- “Boot / Auto Login”
+3- “B2 Console Autologin”
+
+Configuración del Auto-run Script
+
+Para decirle al sistema operativo que carge el script para el usuario Pi en una terminal escribir:
+
+sudo nano /etc/profile
+
+Ir al final del documento y agregar la siguiente línea:
+
+sh /home/pi/riego.sh
+
+El archivo riego.sh tendrá el siguiente contenido:
+
+Utilizando la utilidad nano, escribimos nano riego.sh y presionamos Enter.
+
+#!/bin/bash
+result=`ps aux | grep -i "riego.py" | grep -v "grep" | wc -l`
+if [ $result -ge 1 ]
+   then
+        sudo killall -9 sudo nohup python ./riego.py
+   else
+        echo "script is not running"
+fi
+
+cd /
+cd home/pi
+sudo nohup python -u ./riego.py >> /home/pi/riego.log &
+cd /
+
+Para guardar los cambios presionamos las teclas “Ctrl+X” y luego “Y” seguido por “Enter” dos veces.
+
+Explicamos el script:
+
+Primero verificamos que no esté en ejecución el programa y si lo está lo finalizamos.
+En las líneas finales iniciamos nuestro programa en python utilizando el comienzo nohup, que nos permite que el script siga en ejecución aunque se cierre la terminal. 
+El llamado a ejecutar python lo hacemos con la opción -u, para permitir mostrar la salida en pantalla.
+
+Al utilizar el & al final, le estamos diciendo que se ejecute en el background, aunque no se muestre nada en pantalla.
+
+Reiniciamos y verificamos el funcionamiento
+
+sudo reboot
+
+Ingresamos en la terminal y escribimos
+
+ps aux | grep riego.py
+
+Nos mostrará algo así:
+
+root      4144  0.0  0.3   9948  3280 pts/0    S    08:30   0:00 sudo nohup python -u ./riego.py
+root      4145 98.3  1.1  17244 10452 pts/0    R    08:30  33:04 python -u ./riego.py
+pi        4343  0.0  0.0   7360   548 pts/0    S+   09:04   0:00 grep --color=auto riego.py
